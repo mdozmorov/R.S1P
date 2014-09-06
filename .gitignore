@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.RData
+packrat/lib*/
+data/
+cache/
+img/
+*.html
+*.Rproj
