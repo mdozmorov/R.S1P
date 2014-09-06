@@ -90,7 +90,7 @@ cat("Number of differentially UPregulated genes:", nrow(res[res$adj.P.Val < 0.1 
 cat("Number of differentially DOWNregulated genes:", nrow(res[res$adj.P.Val < 0.1 & res$logFC < 0, ]))
 res.selected <- subset(res, Gene.symbol %in% selected.genes)[, c("Gene.symbol", "logFC", "adj.P.Val")]
 
-par(mfrow=c(10,4))
+par(mfrow=c(13,4))
 sapply(rownames(res.selected[order(res.selected$Gene.symbol), ]), function(x) {
   boxplot(exprs(eset[[1]])[x, pData(eset[[1]])$tissue == group.names[1]],
           exprs(eset[[1]])[x, pData(eset[[1]])$tissue == group.names[2]],
