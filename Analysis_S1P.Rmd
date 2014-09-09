@@ -8,7 +8,7 @@ output: html_document
 ```{r setup, echo=FALSE, include=FALSE, cache=FALSE}
 # Set up the environment
 library(knitr) 
-opts_chunk$set(cache.path='cache/', fig.path='img/', cache=T, tidy=T, fig.keep='high', echo=T, dpi=300, out.width=700)
+opts_chunk$set(cache.path='cache/', fig.path='img/', cache=F, tidy=T, fig.keep='high', echo=T, dpi=300, out.width=700)
 options(replace.assign=TRUE, width=120)
 set.seed(1)
 ```
@@ -17,6 +17,7 @@ set.seed(1)
 suppressMessages(library("GEOquery"))
 #library("affy")
 suppressMessages(library("limma"))
+library(sva)
 
 # Function to get GDS data from GEO, adjust its log2 status and return log2-transformed quantile normalized data
 egds <- function(GDS, selected.genes) {
@@ -35,22 +36,24 @@ egds <- function(GDS, selected.genes) {
   # Extract annotation for selected genes
   gpl<-getGEO(Meta(gds)$platform, destdir="data/") # Get the annotation data for this platform from GEO
   annot <- Table(gpl)[Table(gpl)[,"Gene Symbol"] %in% selected.genes, c("ID","Gene Symbol","Gene Title")]
+  # Add mapping
+  mappings <- read.table("data//sample_mapping.txt", sep="\t", row.names=1)[pData(eset)[, "sample"], ]
+  pData(eset)$mappings <- mappings
   # Return both objects
   return(list(eset, annot))
 }
 
 # Function to get differentially expressed genes based on condition
 # Current limitation: hard coded 2-group design in contrast matrix
-egds.limma <- function(eset, condition) {
-  mod <- model.matrix(formula(paste("~", condition, "+", 0)), data=pData(eset)) # The pData should exist
+egds.limma <- function(eset, condition, subcondition) {
+  mod <- model.matrix(formula(paste("~", condition, "+", 0)), data=pData(eset)[pData(eset)[, "mappings"] == subcondition, ]) # The pData should exist
   colnames(mod) <- group.names
-  fit <- lmFit(eset, mod)
+  fit <- lmFit(new("ExpressionSet", exprs=exprs(eset)[, pData(eset)[, "mappings"] == subcondition], featureData=AnnotatedDataFrame(fData(eset))), mod)
   cont.matrix <- makeContrasts(paste(group.names[2], "-", group.names[1]), levels=mod) 
   fit2 <- contrasts.fit(fit, cont.matrix)
   fit2 <- eBayes(fit2, 0.01)
   return(topTable(fit2, number=nrow(fit2$coefficients), adjust.method="BH"))
 }
-
 ```
 
 We are evaluating ["Molecular Evaluation of Patient-Derived Colorectal Cancer Explants as a Pre-clinical Mouse Model of Colorectal Cancer"](http://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE35144) study for differential expression of S1P-related genes.
@@ -68,13 +71,15 @@ eset <- egds(GDS, selected.genes)
 
 We check phenotype parameters available for this dataset, and specify the one that defines two groups. We check how many samples are in each group.
 
-```{r, echo=1:4}
+```{r, echo=1:6}
 names(pData(eset[[1]])) # Check which phenoData we have
 condition <- "tissue" # Manually specify which one to use, must specify 2 groups
-# Check how many samples are in each group
-table(pData(eset[[1]])[, condition])
+table(pData(eset[[1]])[, "mappings"]) # How many samples we have in each group
+subcondition <- "Liver"
+# Check how many samples are in each condition, given the subcondition
+table(pData(eset[[1]])[pData(eset[[1]])[, "mappings"] == subcondition, condition])
 pData(eset[[1]])[, condition] <- make.names(pData(eset[[1]])[, condition]) # Make names R friendly
-group.names <- names(table(pData(eset[[1]])[, condition])) # Keep names of the group
+group.names <- make.names(names(table(pData(eset[[1]])[pData(eset[[1]])[, "mappings"] == subcondition, condition]))) # Keep names of the group
 ```
 
 We get differentially expressed genes, extract fold change and p-values for our genes of interest, and visualize them.
@@ -84,7 +89,7 @@ The p-values are adjusted for multiple testing. The fold change (FC) is in regul
 Note that most of the genes are assessed by several probes. All probes are visualized, note #####_##_at Affymetrix IDs. Also note that probes having "x" in their name may cross-react, "s" indicate a gene has a single probe.
 
 ```{r, echo=FALSE, message=FALSE, fig.height=50, results='hide'}
-res <- egds.limma(eset[[1]], condition)
+res <- egds.limma(eset[[1]], condition, subcondition)
 cat("Number of differentially expressed genes:", nrow(res[res$adj.P.Val < 0.1, ]), "out of", nrow(res))
 cat("Number of differentially UPregulated genes:", nrow(res[res$adj.P.Val < 0.1 & res$logFC > 0, ]))
 cat("Number of differentially DOWNregulated genes:", nrow(res[res$adj.P.Val < 0.1 & res$logFC < 0, ]))
@@ -97,6 +102,7 @@ sapply(rownames(res.selected[order(res.selected$Gene.symbol), ]), function(x) {
           main=paste(xmap.genes[as.character(res.selected[x, "Gene.symbol"]), ], x, "\np=", formatC(res.selected[x, "adj.P.Val"], format="e", digits=2), "FC=", formatC(2^res.selected[x, "logFC"], digits=2) ) , xaxt="n", ylab="log expression")
 axis(1, at=c(1,2), labels=group.names, las=2)
 })
+write.table(res, "results/degs_Liver.txt", sep="\t", row.names=F)
 ```
 
 ```{r, echo=FALSE, eval=FALSE}
@@ -112,21 +118,22 @@ require(ggplot2)
 ggplot(data = df.m, aes(x=variable, y=value)) + geom_boxplot(aes(fill=Condition))
 ```
 
-
 ```{r, eval=FALSE, echo=FALSE}
 # Use biomaRt for annotation
-biocLite("biomaRt") 
+# biocLite("biomaRt") 
 library(biomaRt)
 listDatasets(useMart("ensembl")) # List available datasets
 mart<-useMart("ensembl", dataset="hsapiens_gene_ensembl") # Load BIOMART dataset for homo sapiens
 # Information - lists of filters and attributes
-head(listFilters(mart), n=50) # Filters, these are our IDs we'll be subsetting the BIOMART annotations on
-head(listAttributes(mart), n=50) # Attributes, these are annotations we would like to get for our IDs
-Meta(gpl96)$title # Check which microarray we have, to selext the right attributes
+# head(listFilters(mart), n=50) # Filters, these are our IDs we'll be subsetting the BIOMART annotations on
+# head(listAttributes(mart), n=50) # Attributes, these are annotations we would like to get for our IDs
+# Meta(gpl96)$title # Check which microarray we have, to select the right attributes
+gpl@header$title # Check which microarray we have, to select the right attributes
 attr<-listAttributes(mart) # Get all attributes as a table
 attr[grep("affy",attr[,1]),] # Parse them for anything that looks like from affymetrix
+# affy_hg_u133_plus_2   Affy HG U133-PLUS-2 probeset
 # Get annotations from Biomart
-genes.up<-getBM(attributes=c('affy_hg_u133a','external_gene_id','description'), filters='affy_hg_u133a', values=up.ids, mart=mart)#, uniqueRows=T)
-# Clean workspace
-unlink(c("GDS858.soft.gz","genes.up.txt","genes.dn.txt","GPL96.soft"))
+genes <- getBM(attributes=c('affy_hg_u133_plus_2','hgnc_symbol','description'), filters='affy_hg_u133_plus_2', values=rownames(res), mart=mart, uniqueRows=T)
+# (merge(res, genes, by.x="row.names", by.y="affy_hg_u133_plus_2", all.x=TRUE, sort=F))
+
 ```
