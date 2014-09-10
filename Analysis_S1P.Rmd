@@ -20,10 +20,17 @@ suppressMessages(library("limma"))
 library(sva)
 
 # Function to get GDS data from GEO, adjust its log2 status and return log2-transformed quantile normalized data
-egds <- function(GDS, selected.genes) {
+egds <- function(GDS, selected.genes, selected.subset=NA) {
   # Download GDS file, put it in the current directory, and load it. If already downloaded, reuse it
   gds <- getGEO(GDS, destdir="data/", GSEMatrix=T) 
   eset <- GDS2eSet(gds, do.log2=FALSE) # Convert the data to ESET object, do not do any transformation
+  # Add mapping
+  mappings <- read.table("data//sample_mapping.txt", sep="\t", row.names=1)[pData(eset)[, "sample"], ]
+  pData(eset)$mappings <- mappings
+  # If subset is either "human.tumor" or "PDCCE.tumor", then slice the expression set
+  if (!is.na(selected.subset) ) {
+    eset <- new("ExpressionSet", exprs=exprs(eset)[, pData(eset)$tissue == selected.subset], phenoData=AnnotatedDataFrame(pData(eset)[pData(eset)$tissue == selected.subset, ]), featureData=AnnotatedDataFrame(fData(eset)))
+  }  
   # Check if the data is log2-transformed
   ex <- exprs(eset)
   qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
@@ -36,9 +43,6 @@ egds <- function(GDS, selected.genes) {
   # Extract annotation for selected genes
   gpl<-getGEO(Meta(gds)$platform, destdir="data/") # Get the annotation data for this platform from GEO
   annot <- Table(gpl)[Table(gpl)[,"Gene Symbol"] %in% selected.genes, c("ID","Gene Symbol","Gene Title")]
-  # Add mapping
-  mappings <- read.table("data//sample_mapping.txt", sep="\t", row.names=1)[pData(eset)[, "sample"], ]
-  pData(eset)$mappings <- mappings
   # Return both objects
   return(list(eset, annot))
 }
@@ -46,9 +50,11 @@ egds <- function(GDS, selected.genes) {
 # Function to get differentially expressed genes based on condition
 # Current limitation: hard coded 2-group design in contrast matrix
 egds.limma <- function(eset, condition, subcondition) {
-  mod <- model.matrix(formula(paste("~", condition, "+", 0)), data=pData(eset)[pData(eset)[, "mappings"] == subcondition, ]) # The pData should exist
+  selected.pData <- pData(eset)[pData(eset)[, "mappings"] %in% subcondition, ]
+  selected.pData[, "mappings"] <- factor(selected.pData[, "mappings"])
+  mod <- model.matrix(formula(paste("~", condition, "+", 0)), data=selected.pData) # The pData should exist
   colnames(mod) <- group.names
-  fit <- lmFit(new("ExpressionSet", exprs=exprs(eset)[, pData(eset)[, "mappings"] == subcondition], featureData=AnnotatedDataFrame(fData(eset))), mod)
+  fit <- lmFit(new("ExpressionSet", exprs=exprs(eset)[, pData(eset)[, "mappings"] %in% subcondition], featureData=AnnotatedDataFrame(fData(eset))), mod)
   cont.matrix <- makeContrasts(paste(group.names[2], "-", group.names[1]), levels=mod) 
   fit2 <- contrasts.fit(fit, cont.matrix)
   fit2 <- eBayes(fit2, 0.01)
@@ -65,21 +71,23 @@ First, we download and pre-process the dataset, and define our genes of interest
 GDS <- 'GDS4381'
 xmap.genes <- read.table("data//genes_mapping.txt", sep="\t", row.names=1) # Genes with cross-mapping
 cat(selected.genes <- rownames(xmap.genes))
+# Select subset of data, can be "human tumor" or "PDCCE tumor"
+selected.subset <- "human tumor"
 # Get data from GEO
-eset <- egds(GDS, selected.genes)
+eset <- egds(GDS, selected.genes, selected.subset)
 ```
 
 We check phenotype parameters available for this dataset, and specify the one that defines two groups. We check how many samples are in each group.
 
 ```{r, echo=1:6}
 names(pData(eset[[1]])) # Check which phenoData we have
-condition <- "tissue" # Manually specify which one to use, must specify 2 groups
+condition <- "mappings" # Manually specify which one to use, must specify 2 groups
 table(pData(eset[[1]])[, "mappings"]) # How many samples we have in each group
-subcondition <- "Liver"
+subcondition <- c("Colon", "Liver")
 # Check how many samples are in each condition, given the subcondition
-table(pData(eset[[1]])[pData(eset[[1]])[, "mappings"] == subcondition, condition])
+table(pData(eset[[1]])[pData(eset[[1]])[, "mappings"] %in% subcondition, condition])
 pData(eset[[1]])[, condition] <- make.names(pData(eset[[1]])[, condition]) # Make names R friendly
-group.names <- make.names(names(table(pData(eset[[1]])[pData(eset[[1]])[, "mappings"] == subcondition, condition]))) # Keep names of the group
+group.names <- make.names(names(table(pData(eset[[1]])[pData(eset[[1]])[, "mappings"] %in% subcondition, condition]))) # Keep names of the group
 ```
 
 We get differentially expressed genes, extract fold change and p-values for our genes of interest, and visualize them.
@@ -97,12 +105,12 @@ res.selected <- subset(res, Gene.symbol %in% selected.genes)[, c("Gene.symbol", 
 
 par(mfrow=c(13,4))
 sapply(rownames(res.selected[order(res.selected$Gene.symbol), ]), function(x) {
-  boxplot(exprs(eset[[1]])[x, pData(eset[[1]])$tissue == group.names[1]],
-          exprs(eset[[1]])[x, pData(eset[[1]])$tissue == group.names[2]],
+  boxplot(exprs(eset[[1]])[x, pData(eset[[1]])$mappings == group.names[1]],
+          exprs(eset[[1]])[x, pData(eset[[1]])$mappings == group.names[2]],
           main=paste(xmap.genes[as.character(res.selected[x, "Gene.symbol"]), ], x, "\np=", formatC(res.selected[x, "adj.P.Val"], format="e", digits=2), "FC=", formatC(2^res.selected[x, "logFC"], digits=2) ) , xaxt="n", ylab="log expression")
 axis(1, at=c(1,2), labels=group.names, las=2)
 })
-write.table(res, "results/degs_Liver.txt", sep="\t", row.names=F)
+write.table(res, "results/degs_human_Colon-Liver.txt", sep="\t", row.names=F)
 ```
 
 ```{r, echo=FALSE, eval=FALSE}
