@@ -1,0 +1,94 @@
+---
+title: "S1P_correlations"
+author: "Mikhail Dozmorov"
+date: "September 15, 2014"
+output: html_document
+---
+```{r setup, echo=FALSE, include=FALSE, cache=FALSE}
+# Set up the environment
+library(knitr) 
+opts_chunk$set(cache.path='cache/', fig.path='img/', cache=T, tidy=T, fig.keep='high', echo=T, dpi=300)
+options(replace.assign=TRUE, width=120)
+set.seed(1)
+```
+
+```{r loadLibraries, echo=FALSE, warning=FALSE, message=FALSE}
+library(org.Hs.eg.db)
+library(KEGG.db)
+library(gridExtra)
+library(GO.db)
+library(GOstats)
+# Preparing environment for remapping Gene Symbols to Entrez IDs
+x <- org.Hs.egSYMBOL2EG
+# Get the entrez gene identifiers that are mapped to a gene symbol
+mapped_genes <- mappedkeys(x)
+# Convert to a list
+xx <- as.list(x[mapped_genes])
+
+Enrichment <- function(gene.names, use="GO", fileName=NULL, ont="MF")
+{
+  res.genes <- gene.names
+  # Convert selected and all gene names to Entrez IDs, removing NAs
+  sel.entrez <- unlist(xx)[res.genes]; sel.entrez <- sel.entrez[!is.na(sel.entrez)]
+  all.entrez <- unlist(xx)[unique(res$Gene.symbol)]; all.entrez <- all.entrez[!is.na(all.entrez)]
+  # Prepare parameters for the enrichment analysis
+  if (use == "GO")
+    {
+    params <- new('GOHyperGParams', geneIds=sel.entrez, universeGeneIds=all.entrez, ontology=ont,
+ pvalueCutoff=0.05, conditional=F, testDirection='over', annotation="org.Hs.eg.db")
+    }
+ else
+   {
+    params <- new('KEGGHyperGParams', geneIds=sel.entrez, universeGeneIds=all.entrez, pvalueCutoff=0.05, testDirection='over', annotation="org.Hs.eg.db") 
+   }
+  hgOver <- hyperGTest(params)
+  result <- summary(hgOver)
+  result <- cbind(result, p.adjust(result$Pvalue, method="BH")) # Append corrected for multiple testing p-value
+  colnames(result)[length(colnames(result))] <- "p.adj"
+  result <- result[result$p.adj < 0.1 & result$Count > length(res.genes)*0.1, ] # Subset the results keeping FDR at 10% AND have at least 5% of the initial genes
+  if (!is.null(fileName)) {
+    write.table(result, paste("results//", fileName, sep=""), sep="\t", row.names=F)
+  }
+  return(result)
+}
+```
+
+
+Genes best correlated with genes of interest
+----------------------------------------------
+Now, we look at top 40 genes best correlated with our genes of interest. We will look for each gene individually. We will look at 3 answers:
+1) What are the top 40 genes best correlated with a gene of interest?
+2) Are they enriched in gene ontology functions?
+3) Are they enriched in KEGG pathways?
+
+We start with S1PR1. The top 40 co-expressed genes are:
+
+```{r top40_S1PR1, echo=FALSE, fig.height=10}
+gene.of.interest <- "S1PR1"
+res.selected <- read.table("results//degs_selected_Liver.txt", sep="\t", header=T, row.names=1)
+affy.of.interest <- rownames(res.selected)[res.selected$Gene.symbol == gene.of.interest]
+affy.corr <- apply(exprs(eset[[1]]), 1, function(x) cor(exprs(eset[[1]])[affy.of.interest, ], x))
+names(affy.corr) <- rownames(exprs(eset[[1]]))
+affy.corr.top40 <- affy.corr[order(affy.corr, decreasing=T)][1:100]
+gene.corr.top40 <- cbind(res[res$ID %in% names(affy.corr.top40), colnames(res) %in% c("Gene.symbol", "Gene.title", "logFC", "adj.P.Val")], R2=affy.corr.top40)
+#res.GO <- Enrichment(unique(gene.corr.top40$Gene.symbol))
+#res.pathway <- Enrichment(gene.corr.top40$Gene.symbol, "KEGG")
+#print(dim(res.GO))
+grid.table(gene.corr.top40[1:40, ], gp=gpar(fontsize=6))
+```
+
+If we expand our list, and take top 100 genes co-expressed with S1PR1, they share the following functions:
+
+```{r go_S1PR1, eval=FALSE}
+print(gene.corr.top40[1:10,])
+print(dim(res.GO))
+#if (res.GO[[2]] > 0) kable(res.GO[[1]])
+#grid.table(res.GO[[1]], gp=gpar(fontsize=6))
+```
+
+And KEGG pathways
+
+```{r kegg_S1PR1, echo=FALSE, eval=FALSE}
+if (res.pathway[[2]]) kable(res.pathway[[1]])
+#grid.table(res.pathway[[1]], gp=gpar(fontsize=6))
+```
