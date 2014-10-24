@@ -8,17 +8,16 @@ output: html_document
 ```{r setup, echo=FALSE, include=FALSE, cache=FALSE}
 # Set up the environment
 library(knitr) 
-opts_chunk$set(cache.path='cache/', fig.path='img/', cache=F, tidy=T, fig.keep='high', echo=T, dpi=300, out.width=700)
+opts_chunk$set(cache.path='cache/', fig.path='img/', cache=T, tidy=T, fig.keep='high', echo=T, dpi=300, out.width=700)
 options(replace.assign=TRUE, width=120)
 set.seed(1)
 ```
 
 ```{r loadLibraries, echo=FALSE, warning=FALSE, message=FALSE}
-suppressMessages(library("GEOquery"))
+library("GEOquery")
 #library("affy")
-suppressMessages(library("limma"))
-library(sva)
-
+library("limma")
+#library(sva)
 # Function to get GDS data from GEO, adjust its log2 status and return log2-transformed quantile normalized data
 egds <- function(GDS, selected.genes) {
   # Download GDS file, put it in the current directory, and load it. If already downloaded, reuse it
@@ -45,10 +44,10 @@ egds <- function(GDS, selected.genes) {
 
 # Function to get differentially expressed genes based on condition
 # Current limitation: hard coded 2-group design in contrast matrix
-egds.limma <- function(eset, condition, subcondition) {
-  mod <- model.matrix(formula(paste("~", condition, "+", 0)), data=pData(eset)[pData(eset)[, "mappings"] == subcondition, ]) # The pData should exist
+egds.limma <- function(es, cond, subcond) {
+  mod <- model.matrix(formula(paste("~", cond, "+", 0)), data=pData(es)[pData(es)$mappings == subcond, ]) # The pData should exist
   colnames(mod) <- group.names
-  fit <- lmFit(new("ExpressionSet", exprs=exprs(eset)[, pData(eset)[, "mappings"] == subcondition], featureData=AnnotatedDataFrame(fData(eset))), mod)
+  fit <- lmFit(new("ExpressionSet", exprs=exprs(es)[, pData(es)$mappings == subcond], featureData=AnnotatedDataFrame(fData(es))), mod)
   cont.matrix <- makeContrasts(paste(group.names[2], "-", group.names[1]), levels=mod) 
   fit2 <- contrasts.fit(fit, cont.matrix)
   fit2 <- eBayes(fit2, 0.01)
@@ -74,12 +73,12 @@ We check phenotype parameters available for this dataset, and specify the one th
 ```{r, echo=1:6}
 names(pData(eset[[1]])) # Check which phenoData we have
 condition <- "tissue" # Manually specify which one to use, must specify 2 groups
-table(pData(eset[[1]])[, "mappings"]) # How many samples we have in each group
+table(pData(eset[[1]])$mappings) # How many samples we have in each group
 subcondition <- "Liver"
 # Check how many samples are in each condition, given the subcondition
-table(pData(eset[[1]])[pData(eset[[1]])[, "mappings"] == subcondition, condition])
+table(pData(eset[[1]])[pData(eset[[1]])$mappings == subcondition, condition])
 pData(eset[[1]])[, condition] <- make.names(pData(eset[[1]])[, condition]) # Make names R friendly
-group.names <- make.names(names(table(pData(eset[[1]])[pData(eset[[1]])[, "mappings"] == subcondition, condition]))) # Keep names of the group
+group.names <- make.names(names(table(pData(eset[[1]])[pData(eset[[1]])$mappings == subcondition, condition]))) # Keep names of the group
 ```
 
 We get differentially expressed genes, extract fold change and p-values for our genes of interest, and visualize them.
@@ -90,11 +89,13 @@ Note that most of the genes are assessed by several probes. All probes are visua
 
 ```{r, echo=FALSE, message=FALSE, fig.height=50, results='hide'}
 res <- egds.limma(eset[[1]], condition, subcondition)
+#write.table(res, "results/degs_Liver.txt", sep="\t", row.names=F)
 cat("Number of differentially expressed genes:", nrow(res[res$adj.P.Val < 0.1, ]), "out of", nrow(res))
 cat("Number of differentially UPregulated genes:", nrow(res[res$adj.P.Val < 0.1 & res$logFC > 0, ]))
 cat("Number of differentially DOWNregulated genes:", nrow(res[res$adj.P.Val < 0.1 & res$logFC < 0, ]))
-res.selected <- subset(res, Gene.symbol %in% selected.genes)[, c("Gene.symbol", "logFC", "adj.P.Val")]
 
+res.selected <- subset(res, Gene.symbol %in% selected.genes)[, c("Gene.symbol", "logFC", "adj.P.Val")]
+#write.table(res.selected, "results/degs_selected_Liver.txt", sep="\t", row.names=T)
 par(mfrow=c(13,4))
 sapply(rownames(res.selected[order(res.selected$Gene.symbol), ]), function(x) {
   boxplot(exprs(eset[[1]])[x, pData(eset[[1]])$tissue == group.names[1]],
@@ -102,20 +103,28 @@ sapply(rownames(res.selected[order(res.selected$Gene.symbol), ]), function(x) {
           main=paste(xmap.genes[as.character(res.selected[x, "Gene.symbol"]), ], x, "\np=", formatC(res.selected[x, "adj.P.Val"], format="e", digits=2), "FC=", formatC(2^res.selected[x, "logFC"], digits=2) ) , xaxt="n", ylab="log expression")
 axis(1, at=c(1,2), labels=group.names, las=2)
 })
-write.table(res, "results/degs_Liver.txt", sep="\t", row.names=F)
 ```
+
+
 
 ```{r, echo=FALSE, eval=FALSE}
 # https://stackoverflow.com/questions/14604439/plot-multiple-boxplot-in-one-graph
 library(reshape2)
-df <- data.frame(t(rbind(pData(eset)$tissue,
-            cbind(exprs.selected.q[rownames(res.selected), pData(eset)$tissue == group.names[1]],
-                  exprs.selected.q[rownames(res.selected), pData(eset)$tissue == group.names[2]]))))
-colnames(df) <- make.names(c("Label", paste(rownames(res.selected), res.selected$Gene)))
+df <- data.frame(tissue = pData(eset[[1]])$tissue, t(exprs(eset[[1]])[rownames(res.selected), ]))
+df <- melt(df, id.var = "tissue", value.name = "expression", variable.name = "probeset")
+
+library(ggplot2)
+ggplot(df, aes(probeset, expression)) + geom_boxplot(aes(fill = tissue))
+
+colnames(df) <- res.selected$Gene.symbol[match(colnames(df), rownames(res.selected))]
+colnames(df)[1] <- "Label"
+
 row.names(df) <- NULL
 df.m <- melt(df, id.var="Label")
 require(ggplot2)
 ggplot(data = df.m, aes(x=variable, y=value)) + geom_boxplot(aes(fill=Condition))
+
+head(df)
 ```
 
 ```{r, eval=FALSE, echo=FALSE}
