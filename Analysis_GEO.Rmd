@@ -1,0 +1,308 @@
+---
+title: "Analysis_GEO"
+author: "Mikhail Dozmorov"
+date: "October 18, 2014"
+output: html_document
+---
+
+```{r setup, echo=FALSE, include=FALSE, cache=FALSE}
+# Set up the environment
+library(knitr) 
+opts_chunk$set(cache.path='cache/', fig.path='img/', cache=T, tidy=T, fig.keep='high', echo=F, dpi=300, out.width=700)
+options(replace.assign=TRUE, width=120)
+set.seed(1)
+```
+
+```{r loadLibraries, echo=FALSE, warning=FALSE, message=FALSE}
+library("GEOquery")
+library("limma")
+library("dplyr")
+#library(arrayQualityMetrics)
+suppressMessages(library(org.Hs.eg.db))
+library(KEGG.db)
+suppressMessages(library(GO.db))
+suppressMessages(library(GOstats))
+# Preparing environment for remapping Gene Symbols to Entrez IDs
+x <- org.Hs.egSYMBOL2EG
+# Get the entrez gene identifiers that are mapped to a gene symbol
+mapped_genes <- mappedkeys(x)
+# Convert to a list
+xx <- as.list(x[mapped_genes])
+
+# Perform GO enrichment analysis of topTable produced by limma.
+# use use for KEGG of GO enrichment analyses
+# Provide which ontology space to use, "MF", "BP", of "CC"
+# Returns a list of the results, and total count of significant enrichments
+Enrichment <- function(res, use="GO", fileName=NULL, ont="BP")
+{
+  res.genes <- res #as.character(unique(annot.f[rownames(res), "GeneName"]))
+  # Convert selected and all gene names to Entrez IDs, removing NAs
+  sel.entrez <- unlist(xx)[res.genes]; sel.entrez <- sel.entrez[!is.na(sel.entrez)]
+  all.entrez <- unlist(xx); all.entrez <- all.entrez[!is.na(all.entrez)]
+  # Prepare parameters for the enrichment analysis
+  if (use == "GO")
+    {
+    params <- new('GOHyperGParams', geneIds=sel.entrez, universeGeneIds=all.entrez, ontology=ont,
+ pvalueCutoff=0.05, conditional=F, testDirection='over', annotation="org.Hs.eg.db")
+    }
+ else
+   {
+    params <- new('KEGGHyperGParams', geneIds=sel.entrez, universeGeneIds=all.entrez, pvalueCutoff=0.05, testDirection='over', annotation="org.Hs.eg.db") 
+   }
+  hgOver <- hyperGTest(params)
+  result <- summary(hgOver)
+  result <- cbind(result, p.adjust(result$Pvalue, method="BH")) # Append corrected for multiple testing p-value
+  colnames(result)[length(colnames(result))] <- "p.adj"
+  result <- result[result$p.adj < 0.1, ] # Subset the results keeping FDR at 10%
+  if (!is.null(fileName)) {
+    write.table(result, paste("results//", fileName, sep=""), sep="\t", row.names=F)
+  }
+  return(result)
+}
+```
+
+
+
+Tsuji BrJSurg 2012: Paper form Japan. They examined both primary (n=56) and metastatic tumors (n=27) with 3 of those being from peritoneum. Problem is they are all labeled as "unresectable CRC". This has the same problem as Grone et al but they have the actual peritoneal tumor which is good.
+[http://www.ncbi.nlm.nih.gov/sites/GDSbrowser?acc=GDS4393](http://www.ncbi.nlm.nih.gov/sites/GDSbrowser?acc=GDS4393)
+
+```{r Tsuji}
+GDS <- 'GSE28702'
+gds <- getGEO(GDS, destdir="data/", GSEMatrix=T) 
+write.table(pData(gds$GSE28702_series_matrix.txt.gz), "results/GSE28702_meta.txt", sep="\t", row.names=F)
+# Use if GSEMatrix=F
+# write.table(as.data.frame(lapply(gds@gsms, function(x) {x@header$characteristics_ch1})), paste("results/", GDS, "_meta.txt", sep=""), sep="\t")
+eset <- new('ExpressionSet', exprs=exprs(gds$GSE28702_series_matrix.txt.gz), phenoData=phenoData(gds$GSE28702_series_matrix.txt.gz))
+# Check if the data is log2-transformed
+ex <- exprs(eset)
+qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
+LogC <- (qx[5] > 100) ||
+          (qx[6]-qx[1] > 50 && qx[2] > 0) ||
+          (qx[2] > 0 && qx[2] < 1 && qx[4] > 1 && qx[4] < 2)
+if (LogC) { ex[which(ex <= 0)] <- NaN
+  exprs(eset) <- log2(ex) } # Log2-transform, if necessary
+exprs(eset) <- normalizeQuantiles(exprs(eset)) # Quantile normalize the data
+
+annot <- tbl_df(fData(gds$GSE28702_series_matrix.txt.gz)[, c(11, 10)]) # Extract gene symbol and description
+annot <- mutate(annot, Probe.set=rownames(annot))
+colnames(annot) <- make.names(colnames(annot))
+```
+
+Quality control showed uniform quality of all samples
+```{r qc}
+# arrayQualityMetrics(eset)
+#head(exprs(eset))
+```
+
+Let's investigate some phenoData
+```{r TsujiPheno}
+table(pData(eset)$characteristics_ch1) # Metastatic/primary
+table(pData(eset)$characteristics_ch1.1) # Location
+table(pData(eset)$characteristics_ch1.2) # Responder/non
+table(pData(eset)$characteristics_ch1.3) # Gender
+table(pData(eset)$characteristics_ch1.1, pData(eset)$characteristics_ch1)
+```
+
+Metastatic vs. primary, all sites
+----------------
+We get select differentially expressed genes at adjusted p-value < 0.05 and showing at least 2-fold change
+```{r limma_metVsPrim}
+mod <- model.matrix(formula(paste("~", "characteristics_ch1", "+", 0)), data=pData(eset)) # The pData should exist
+colnames(mod) <- make.names(colnames(mod)) # Make names compatible..
+fit <- lmFit(eset, mod)
+cont.matrix <- makeContrasts(paste(colnames(mod)[1], "-", colnames(mod)[2]), levels=mod) 
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2, 0.01)
+degs <- (topTable(fit2, number=nrow(fit2$coefficients), adjust.method="BH", p.value=0.05, lfc=1))
+print("Total number of DEGs")
+dim(degs)
+print("Upregulated DEGs")
+dim(subset(degs, logFC > 0))
+print("Downregulated DEGs")
+dim(subset(degs, logFC < 0))
+degs.genes <- annot %>% filter(Probe.set %in% rownames(degs)) %>% select(Gene.Symbol) %>% distinct
+degs.genes <- unique(unlist(strsplit(as.character(degs.genes[["Gene.Symbol"]]), " /// ")))
+```
+
+They are enriched in the following pathways:
+
+```{r KEGG_metVsPrim}
+res.pathway <- Enrichment(degs.genes, "KEGG")
+if (nrow(res.pathway) > 10) n <-10 else n <- nrow(res.pathway)
+grid.table(res.pathway[1:n, ], gp=gpar(fontsize=7))
+```
+
+and gene ontologies:
+
+```{r GO_metVsPrim}
+res.pathway <- Enrichment(degs.genes, "GO", ont="BP")
+if (nrow(res.pathway) > 10) n <-10 else n <- nrow(res.pathway)
+grid.table(res.pathway[1:n, ], gp=gpar(fontsize=7))
+```
+
+Peritoneum vs. all other sites
+----------------
+We get select differentially expressed genes at adjusted p-value < 0.05 and showing at least 2-fold change
+```{r limma_PeriVsOther}
+mod <- data.frame(Peritoneum=as.numeric(pData(eset)$characteristics_ch1.1 == "location: Peritoneum"), Others=as.numeric(pData(eset)$characteristics_ch1.1 != "location: Peritoneum"))
+fit <- lmFit(eset, mod)
+cont.matrix <- makeContrasts(paste(colnames(mod)[1], "-", colnames(mod)[2]), levels=mod) 
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2, 0.01)
+degs <- (topTable(fit2, number=nrow(fit2$coefficients), adjust.method="BH", p.value=0.05, lfc=1))
+print("Total number of DEGs")
+dim(degs)
+print("Upregulated DEGs")
+dim(subset(degs, logFC > 0))
+print("Downregulated DEGs")
+dim(subset(degs, logFC < 0))
+degs.genes <- annot %>% filter(Probe.set %in% rownames(degs)) %>% select(Gene.Symbol) %>% distinct
+degs.genes <- unique(unlist(strsplit(as.character(degs.genes[["Gene.Symbol"]]), " /// ")))
+```
+
+They are enriched in the following pathways:
+
+```{r KEGG_PeriVsOther}
+res.pathway <- Enrichment(degs.genes, "KEGG")
+if (nrow(res.pathway) > 10) n <-10 else n <- nrow(res.pathway)
+grid.table(res.pathway[1:n, ], gp=gpar(fontsize=7))
+```
+
+and gene ontologies:
+
+```{r GO_PeriVsOther}
+res.pathway <- Enrichment(degs.genes, "GO", ont="BP")
+if (nrow(res.pathway) > 10) n <-10 else n <- nrow(res.pathway)
+grid.table(res.pathway[1:n, ], gp=gpar(fontsize=7))
+```
+
+Peritoneum vs. Liver, metastatic sites only
+----------------
+We get select differentially expressed genes at adjusted p-value < 0.05 and showing at least 2-fold change
+```{r limma_PeriVsLiver}
+es <- new("ExpressionSet", exprs=exprs(eset)[, (pData(eset)$characteristics_ch1.1 == "location: Peritoneum" | pData(eset)$characteristics_ch1.1 == "location: Liver")], phenoData=AnnotatedDataFrame(pData(eset)[(pData(eset)$characteristics_ch1.1 == "location: Peritoneum" | pData(eset)$characteristics_ch1.1 == "location: Liver"), ]))
+mod <- data.frame(Peritoneum=as.numeric(pData(es)$characteristics_ch1.1 == "location: Peritoneum"), Liver=as.numeric(pData(es)$characteristics_ch1.1 != "location: Peritoneum"))
+fit <- lmFit(es, mod)
+cont.matrix <- makeContrasts(paste(colnames(mod)[1], "-", colnames(mod)[2]), levels=mod) 
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2, 0.01)
+degs <- (topTable(fit2, number=nrow(fit2$coefficients), adjust.method="BH", p.value=0.05, lfc=1))
+print("Total number of DEGs")
+dim(degs)
+print("Upregulated DEGs")
+dim(subset(degs, logFC > 0))
+print("Downregulated DEGs")
+dim(subset(degs, logFC < 0))
+degs.genes <- annot %>% filter(Probe.set %in% rownames(degs)) %>% select(Gene.Symbol) %>% distinct
+degs.genes <- unique(unlist(strsplit(as.character(degs.genes[["Gene.Symbol"]]), " /// ")))
+```
+
+They are enriched in the following pathways:
+
+```{r KEGG_PeriVsLiver}
+res.pathway <- Enrichment(degs.genes, "KEGG")
+if (nrow(res.pathway) > 10) n <-10 else n <- nrow(res.pathway)
+grid.table(res.pathway[1:n, ], gp=gpar(fontsize=7))
+```
+
+and gene ontologies:
+
+```{r GO_PeriVsLiver}
+res.pathway <- Enrichment(degs.genes, "GO", ont="BP")
+if (nrow(res.pathway) > 10) n <-10 else n <- nrow(res.pathway)
+grid.table(res.pathway[1:n, ], gp=gpar(fontsize=7))
+```
+
+Responders vs. non-responders, all sites
+-----
+We get select differentially expressed genes at adjusted p-value < 0.05 and showing at least 2-fold change
+```{r limma_RespVsNonresp}
+mod <- data.frame(Responders=as.numeric(pData(eset)$characteristics_ch1.2 == "mfolfox6: responder"), NonResponders=as.numeric(pData(eset)$characteristics_ch1.2 != "mfolfox6: responder"))
+fit <- lmFit(eset, mod)
+cont.matrix <- makeContrasts(paste(colnames(mod)[1], "-", colnames(mod)[2]), levels=mod) 
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2, 0.01)
+degs <- (topTable(fit2, number=nrow(fit2$coefficients), adjust.method="BH", p.value=0.05, lfc=1))
+print("Total number of DEGs")
+dim(degs)
+print("Upregulated DEGs")
+dim(subset(degs, logFC > 0))
+print("Downregulated DEGs")
+dim(subset(degs, logFC < 0))
+(degs.genes <- annot %>% filter(Probe.set %in% rownames(degs)) %>% select(Gene.Symbol) %>% distinct)
+#degs.genes <- unique(unlist(strsplit(as.character(degs.genes[["Gene.Symbol"]]), " /// ")))
+```
+
+There's only one gene that is 2-fold different.
+
+Male vs. Female, all sites
+----------------
+We get select differentially expressed genes at adjusted p-value < 0.05 and showing at least 2-fold change
+```{r limma_MaleVsFemale}
+mod <- data.frame(Male=as.numeric(pData(eset)$characteristics_ch1.3 == "gender: M"), Female=as.numeric(pData(eset)$characteristics_ch1.3 != "gender: M"))
+fit <- lmFit(eset, mod)
+cont.matrix <- makeContrasts(paste(colnames(mod)[1], "-", colnames(mod)[2]), levels=mod) 
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2, 0.01)
+degs <- (topTable(fit2, number=nrow(fit2$coefficients), adjust.method="BH", p.value=0.05, lfc=1))
+print("Total number of DEGs")
+dim(degs)
+print("Upregulated DEGs")
+dim(subset(degs, logFC > 0))
+print("Downregulated DEGs")
+dim(subset(degs, logFC < 0))
+degs.genes <- annot %>% filter(Probe.set %in% rownames(degs)) %>% select(Gene.Symbol) %>% distinct
+degs.genes <- unique(unlist(strsplit(as.character(degs.genes[["Gene.Symbol"]]), " /// ")))
+```
+
+They are enriched in the following pathways:
+
+```{r KEGG_MaleVsFemale}
+res.pathway <- Enrichment(degs.genes, "KEGG")
+if (nrow(res.pathway) > 10) n <-10 else n <- nrow(res.pathway)
+grid.table(res.pathway[1:n, ], gp=gpar(fontsize=7))
+```
+
+and gene ontologies:
+
+```{r GO_MaleVsFemale}
+res.pathway <- Enrichment(degs.genes, "GO", ont="BP")
+if (nrow(res.pathway) > 10) n <-10 else n <- nrow(res.pathway)
+grid.table(res.pathway[1:n, ], gp=gpar(fontsize=7))
+```
+
+Not run
+--------
+Grone IntJCRDis 2011: Paper from Germany, they examined primary tumors in 53 patients, 13 patients developed metastasis later, 4 of those being peritoneal carcinomatosis. With this paper we could potentially examine our genes of interest and see if they are predictors of developing peritoneal carcinomatosis. The problem with this dataset is that I couldn't tell which samples(patients) are the ones that developed metastasis. If you can find that information in the raw data or elsewhere I think this dataset may be worth looking at. Alternatively, if we can't find it and it looks like the quality of the data is good I can write to the author and see if they give me the breakdown of the samples.
+[http://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?token=hncvtygaygqmghg&acc=GSE18088](http://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?token=hncvtygaygqmghg&acc=GSE18088)
+
+```{r Grone, echo=F, message=FALSE, warning=FALSE, eval=FALSE}
+GDS <- 'GSE18088'
+gds <- getGEO(GDS, destdir="data/", GSEMatrix=T) 
+write.table(pData(gds$GSE18088_series_matrix.txt.gz), paste("results/", GDS, "_meta.txt", sep=""), sep="\t")
+```
+
+Smith Gastoenterology 2012: Paper from Vanderbilt and Moffitt. One dataset from each place (Total n=232), one used as a training set and the other as a testing set to develop a gene expression predictor of recurrence. The had recurrences but they don't specify how many (if any) developed peritoneal carcinomatosis.
+[http://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE17538](http://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE17538)
+
+```{r Smith, eval=FALSE}
+GDS <- 'GSE17538'
+gds <- getGEO(GDS, destdir="data/", GSEMatrix=F) 
+write.table(pData(gds[[1]]), paste("results/", GDS, "_meta.txt", sep=""), sep="\t")
+
+
+# Extract annotation for selected genes
+  gpl<-getGEO(Meta(gds)$platform, destdir="data/") # Get the annotation data for this platform from GEO
+  annot <- Table(gpl)[Table(gpl)[,"Gene Symbol"] %in% selected.genes, c("ID","Gene Symbol","Gene Title")]
+  # Add mapping
+  mappings <- read.table("data//sample_mapping.txt", sep="\t", row.names=1)[pData(eset)[, "sample"], ]
+  pData(eset)$mappings <- mappings
+
+
+
+xmap.genes <- read.table("data//genes_mapping.txt", sep="\t", row.names=1) # Genes with cross-mapping
+cat(selected.genes <- rownames(xmap.genes))
+# Get data from GEO
+eset <- egds(GDS, selected.genes)
+```
+
